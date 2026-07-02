@@ -59,8 +59,52 @@ def extract_text_from_file(uploaded_file):
         st.error(f"文件解析失败: {e}")
         return None
     
-    # =========================================================
-# 2. 核心合同审核 Agent（基于 LangGraph）
+# =========================================================
+# 2. 长文本分块 & 去重工具
+# =========================================================
+def chunk_contract_text(text: str, chunk_size: int = 2500, overlap: int = 200):
+    """将长文本按段落切分成固定大小的块，块之间带重叠窗口。
+
+    重叠窗口的作用：防止某个条款恰好卡在两块的分界处被截断。
+    例如：'第八条 违约责任：...' 如果刚好被切开，前半段的条款名
+    会出现在上一块的末尾（overlap 区域），下一块会重新覆盖到。
+    """
+    if len(text) <= chunk_size:
+        return [text]
+
+    paragraphs = text.split('\n')
+    chunks = []
+    current_chunk = ""
+
+    for para in paragraphs:
+        if len(current_chunk) + len(para) <= chunk_size:
+            current_chunk += para + '\n'
+        else:
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            # 下一块开头带上上一块的尾巴（overlap 字符），防止条款被截断
+            tail = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+            current_chunk = tail + para + '\n'
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+def merge_and_deduplicate_clauses(all_clauses: list) -> list:
+    """合并去重：同名条款只保留内容最长的那个（信息量最大）"""
+    merged = {}
+    for clause in all_clauses:
+        name = clause.get("clause_name", "")
+        content = clause.get("content", "")
+        if name not in merged or len(content) > len(merged[name]["content"]):
+            merged[name] = clause
+    return list(merged.values())
+
+
+# =========================================================
+# 3. 核心合同审核 Agent（基于 LangGraph）
 # =========================================================
 def run_agent(contract_text: str, api_key: str = None):
     """执行合同审核流程，返回最终状态字典"""
@@ -82,24 +126,38 @@ def run_agent(contract_text: str, api_key: str = None):
 
     # ---------- 提取条款 ----------
     def extract_key_clauses(text: str):
-        truncated = text[:3000]
-        prompt = f"""
-        从以下合同中提取关键条款，严格按照JSON列表格式返回，不要包含其他内容。
+        # 短合同直接处理，长合同先分块再逐块提取
+        chunks = chunk_contract_text(text)
+        all_clauses = []
+
+        for i, chunk in enumerate(chunks):
+            chunk_label = f"（第{i+1}/{len(chunks)}段）" if len(chunks) > 1 else ""
+            prompt = f"""
+        从以下合同{chunk_label}中提取关键条款，严格按照JSON列表格式返回，不要包含其他内容。
         重点关注：违约责任、赔偿上限、保密义务、合同终止。
-        如果某条款不存在，则不提取。
-        合同内容：{truncated}
-        
+        如果某条款不存在，则不提取（返回空列表 []）。
+        合同内容：{chunk}
+
         输出示例：[{{"clause_name": "违约责任", "content": "违约金为合同总额的20%"}}]
         """
-        resp = llm.invoke(prompt).content.strip()
-        try:
-            if "```" in resp:
-                resp = resp.split("```")[1]
-                if resp.startswith("json"):
-                    resp = resp[4:]
-            return json.loads(resp)
-        except:
-            return [{"clause_name": "解析异常", "content": "请检查返回格式"}]
+            resp = llm.invoke(prompt).content.strip()
+            try:
+                if "```" in resp:
+                    resp = resp.split("```")[1]
+                    if resp.startswith("json"):
+                        resp = resp[4:]
+                clauses = json.loads(resp)
+                if isinstance(clauses, list):
+                    all_clauses.extend(clauses)
+            except Exception:
+                # 单块解析失败不中断全局，继续处理下一块
+                continue
+
+        if not all_clauses:
+            return [{"clause_name": "解析异常", "content": "所有分块均未能提取到条款，请检查合同格式"}]
+
+        # 同名条款去重：保留内容最完整的版本
+        return merge_and_deduplicate_clauses(all_clauses)
 
     # ---------- 识别风险 ----------
     def identify_risks(clauses: List[dict]):
