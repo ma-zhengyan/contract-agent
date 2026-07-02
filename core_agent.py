@@ -133,12 +133,16 @@ def run_agent(contract_text: str, api_key: str = None):
         for i, chunk in enumerate(chunks):
             chunk_label = f"（第{i+1}/{len(chunks)}段）" if len(chunks) > 1 else ""
             prompt = f"""
-        从以下合同{chunk_label}中提取关键条款，严格按照JSON列表格式返回，不要包含其他内容。
-        重点关注：违约责任、赔偿上限、保密义务、合同终止。
-        如果某条款不存在，则不提取（返回空列表 []）。
-        合同内容：{chunk}
+        从以下合同文本{chunk_label}中提取关键条款，严格按照JSON列表格式返回。
+        请仔细查找合同中与以下维度相关的条款：违约责任、赔偿上限、保密义务、合同终止。
+        每条条款提取 clause_name（条款名称）和 content（条款原文摘要）。
+        如果实在找不到以上任一维度的条款，返回空列表 []。
 
-        输出示例：[{{"clause_name": "违约责任", "content": "违约金为合同总额的20%"}}]
+        合同文本{chunk_label}：
+        {chunk}
+
+        输出示例：
+        [{{"clause_name": "违约责任", "content": "违约金为合同总额的20%"}}]
         """
             resp = llm.invoke(prompt).content.strip()
             try:
@@ -207,7 +211,16 @@ def run_agent(contract_text: str, api_key: str = None):
 
     def risk_node(state: ContractState):
         st.session_state.progress_text = "正在分析风险..."
-        risks = identify_risks(state["extracted_clauses"])
+        clauses = state["extracted_clauses"]
+
+        # 条款提取失败时跳过风险分析，直接标记为需人工复核
+        if isinstance(clauses, list) and len(clauses) == 1 and clauses[0].get("clause_name") == "解析异常":
+            return {
+                "risk_report": [{"risk": clauses[0]["content"], "level": "中", "suggestion": "请检查合同文件格式是否正确，或尝试手动粘贴合同内容"}],
+                "need_human_review": True
+            }
+
+        risks = identify_risks(clauses)
         need = any(r.get("level") == "高" for r in risks) if isinstance(risks, list) else False
         return {"risk_report": risks, "need_human_review": need}
 
