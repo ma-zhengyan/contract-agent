@@ -7,12 +7,11 @@ st.caption("基于 LangGraph · 支持 PDF / Word / Excel / PPT / TXT")
 
 with st.sidebar:
     st.header("🔑 配置")
-    # 从云端 Secrets 自动读取 Key，不在界面显示输入框
-try:
-    api_key = st.secrets["DEEPSEEK_API_KEY"]
-except:
-    api_key = None
-    st.error("未检测到 DeepSeek API Key，请联系管理员")
+    try:
+        api_key = st.secrets["DEEPSEEK_API_KEY"]
+    except Exception:
+        api_key = None
+        st.error("未检测到 DeepSeek API Key，请联系管理员")
     st.markdown("---")
     st.markdown("**支持格式**：PDF, DOCX, XLSX, PPTX, TXT")
     st.markdown("**审核维度**：违约责任、赔偿上限、保密义务")

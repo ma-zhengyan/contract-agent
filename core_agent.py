@@ -1,6 +1,7 @@
 import os
 import json
 import io
+import uuid
 import operator
 from typing import TypedDict, List, Annotated, Literal
 
@@ -219,14 +220,10 @@ def run_agent(contract_text: str, api_key: str = None):
 
         只返回JSON列表，不要其他内容。
         """
-        resp = llm.invoke(prompt).content.strip()
         try:
-            if "```" in resp:
-                resp = resp.split("```")[1]
-                if resp.startswith("json"):
-                    resp = resp[4:]
-            return json.loads(resp)
-        except:
+            resp = llm.invoke(prompt).content.strip()
+            return _parse_json_response(resp)
+        except Exception:
             return [{"risk": "解析失败", "level": "中", "suggestion": "请人工复核"}]
 
     # ---------- 节点函数 ----------
@@ -292,5 +289,5 @@ def run_agent(contract_text: str, api_key: str = None):
         "current_step": "",
         "need_human_review": False
     }
-    config = {"configurable": {"thread_id": "streamlit_demo"}}
+    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
     return graph.invoke(initial_state, config)
