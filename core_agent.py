@@ -124,12 +124,21 @@ def run_agent(contract_text: str, api_key: str = None):
         current_step: str
         need_human_review: bool
 
-    # ---------- 提取条款 ----------
+    # ---------- AI 响应解析工具 ----------
+    def _parse_json_response(resp: str):
+        """从 AI 响应中提取 JSON，处理 markdown 代码块包裹的情况"""
+        if "```" in resp:
+            resp = resp.split("```")[1]
+            if resp.startswith("json"):
+                resp = resp[4:]
+        return json.loads(resp.strip())
+
+    # ---------- 提取条款（多层 fallback） ----------
     def extract_key_clauses(text: str):
-        # 短合同直接处理，长合同先分块再逐块提取
-        chunks = chunk_contract_text(text)
         all_clauses = []
 
+        # ===== 第一层：分块提取（长合同也能覆盖） =====
+        chunks = chunk_contract_text(text)
         for i, chunk in enumerate(chunks):
             chunk_label = f"（第{i+1}/{len(chunks)}段）" if len(chunks) > 1 else ""
             prompt = f"""
@@ -144,47 +153,70 @@ def run_agent(contract_text: str, api_key: str = None):
         输出示例：
         [{{"clause_name": "违约责任", "content": "违约金为合同总额的20%"}}]
         """
-            resp = llm.invoke(prompt).content.strip()
             try:
-                if "```" in resp:
-                    resp = resp.split("```")[1]
-                    if resp.startswith("json"):
-                        resp = resp[4:]
-                clauses = json.loads(resp)
+                resp = llm.invoke(prompt).content.strip()
+                clauses = _parse_json_response(resp)
                 if isinstance(clauses, list):
                     all_clauses.extend(clauses)
             except Exception:
-                # 单块解析失败不中断全局，继续处理下一块
                 continue
 
+        # ===== 第二层：全文宽松提取（分块失败时的兜底） =====
         if not all_clauses:
-            return [{"clause_name": "解析异常", "content": "所有分块均未能提取到条款，请检查合同格式"}]
+            # 取全文前 8000 字符，不限定维度，让 AI 自由发挥
+            fallback_text = text[:8000]
+            fallback_prompt = f"""
+        你是一个合同审核助手。请从以下合同中提取所有你认为重要的条款。
+        尽量覆盖：违约责任、赔偿上限、保密义务、合同终止、付款条件、交付条款、知识产权等。
+        每条条款提取 clause_name 和 content，严格按JSON列表格式返回。
+        即使只找到一条也请返回，不要返回空列表。
 
-        # 同名条款去重：保留内容最完整的版本
+        合同文本：
+        {fallback_text}
+
+        输出示例：
+        [{{"clause_name": "违约责任", "content": "违约金为合同总额的20%"}}]
+        """
+            try:
+                resp = llm.invoke(fallback_prompt).content.strip()
+                clauses = _parse_json_response(resp)
+                if isinstance(clauses, list) and len(clauses) > 0:
+                    all_clauses = clauses
+            except Exception:
+                pass
+
+        # ===== 最终兜底 =====
+        if not all_clauses:
+            return [{"clause_name": "解析异常", "content": "AI 未能从合同中提取到条款，请检查合同格式或手动粘贴内容"}]
+
         return merge_and_deduplicate_clauses(all_clauses)
 
     # ---------- 识别风险 ----------
     def identify_risks(clauses: List[dict]):
         if not clauses:
             return []
+        # 过滤掉"解析异常"标记，避免 AI 拿错误信息当条款分析
+        valid_clauses = [c for c in clauses if c.get("clause_name") != "解析异常"]
+        if not valid_clauses:
+            return []
         prompt = f"""
         请扮演资深法务专家，分析以下合同条款的风险点。
-        
+
         风险等级说明：
         - 高风险：可能导致重大经济损失、法律诉讼或合同无效
         - 中风险：存在法律模糊地带，可能需要谈判调整
         - 低风险：轻微瑕疵，不影响核心利益
-        
+
         必须返回JSON列表格式，每个元素包含：
         - "risk": 风险描述（一句话概括）
         - "level": "高"/"中"/"低"
         - "suggestion": 具体修改建议
-        
+
         如果没有风险，返回空列表 []。
-        
+
         待分析的条款：
-        {json.dumps(clauses, ensure_ascii=False)}
-        
+        {json.dumps(valid_clauses, ensure_ascii=False)}
+
         只返回JSON列表，不要其他内容。
         """
         resp = llm.invoke(prompt).content.strip()
@@ -213,10 +245,15 @@ def run_agent(contract_text: str, api_key: str = None):
         st.session_state.progress_text = "正在分析风险..."
         clauses = state["extracted_clauses"]
 
-        # 条款提取失败时跳过风险分析，直接标记为需人工复核
-        if isinstance(clauses, list) and len(clauses) == 1 and clauses[0].get("clause_name") == "解析异常":
+        # 条款提取失败时跳过 AI 分析，直接返回提示
+        has_extraction_error = any(
+            isinstance(c, dict) and c.get("clause_name") == "解析异常"
+            for c in (clauses or [])
+        )
+        if has_extraction_error:
             return {
-                "risk_report": [{"risk": clauses[0]["content"], "level": "中", "suggestion": "请检查合同文件格式是否正确，或尝试手动粘贴合同内容"}],
+                "risk_report": [{"risk": "合同文本解析失败", "level": "中",
+                                 "suggestion": "请检查合同文件格式，或尝试手动粘贴合同内容后重新审核"}],
                 "need_human_review": True
             }
 
